@@ -140,3 +140,14 @@ CREATE TABLE composite_key_copies (
     label     VARCHAR(50) @COLLATE@ NOT NULL,
     PRIMARY KEY (tenant_id, item_no)
 );
+-- java.util.Date attributes stored as DATE, TIME and TIMESTAMP, which Hibernate reports as the java.sql types
+-- (TCK AC-COL-28, D-122).
+CREATE TABLE dated_rows (
+    id    BIGINT NOT NULL PRIMARY KEY,
+    born_on   DATE NOT NULL,
+    rings_at  TIME NOT NULL,
+    logged_at @MICRO_TS@ NOT NULL
+);
+-- A read-only view over orders: an @Immutable entity over it is an ordinary root (TCK AC-COL-29). Plain
+-- CREATE VIEW, which every Tier-1 vendor accepts.
+CREATE VIEW order_view AS SELECT id, customer_id, status, total FROM orders;

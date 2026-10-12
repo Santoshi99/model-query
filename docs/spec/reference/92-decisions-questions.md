@@ -133,7 +133,8 @@ with its converted type. A supertype is rejected: a `Number` column over an `Int
 converter allow-list is empty until a real case needs an entry; a model type other than the attribute's goes through a
 `ColumnConverter` (D-37), and `core` ships ordered ones for a `Timestamp` attribute (D-84). Loosening the check later
 breaks no one; tightening it would. Rejected: accepting any assignable supertype (hides a wrong column until a value
-fails to map). → `api/10` R-COL-08, AC-COL-04.
+fails to map). D-122 loosens it for one case: a `java.util.Date` attribute type reads the `java.sql` subtype the
+provider reports. → `api/10` R-COL-08, AC-COL-04.
 
 **D-21 — The phase-consistency warning runs on first execution, not in `build()`.**
 Checking that a `QueryCustomizer` narrows every phase alike means running it against a real `CriteriaBuilder`, which
@@ -1624,6 +1625,110 @@ Spring binding (not in 0.6). Ships as 0.6.0 in M13. → `rfc/0006`, `api/10` R-C
 `processor/31` R-GEN-32/33, `processor/32` (`MQ3022`), `reference/90` (`MQ1105`), `delivery/61`,
 `docs/plan/mvp-plan.md` §M13.
 
+**D-122 — A `java.util.Date` column matches the `java.sql` type the provider reports (amends R-COL-08 and D-20).** JPA stores a
+`Date` attribute as a `DATE`, `TIME` or `TIMESTAMP`, and Hibernate reports it as `java.sql.Date`, `Time` or
+`Timestamp` (`@Temporal`, defaulting to `TIMESTAMP`), while the processor reads the Java field's declared `Date`. A model
+mirroring its entity compiled and then failed `MQ1001` at first use. The run-time check now accepts any of the three for a
+column whose attribute type is `java.util.Date`; each is a `Date`, so `Row.get` returns it as the field's type and a
+filter binds a plain `Date`, which the provider takes. The processor keeps reading declared types, so it holds no
+provider's typing rules and stays right for a provider that reports `Date` itself. `MQ1001` qualifies the two type names
+when their simple names agree. The check keys on the column's attribute type, so a hand-written `Date` column with
+no converter over a declared `Timestamp` attribute now passes too; it reads a `Timestamp`, which is a `Date`. A
+`ColumnConverter` whose attribute type is `Date` is given the `java.sql` instance, on which `toInstant()` throws for
+`java.sql.Date` and `Time`; it reads `getTime()` instead. The same rule and naming apply to an expression's resolved
+type (`MQ1507`, a `coalesce` over `Date` columns) and to `Agg.of`'s (`MQ1405`). An insert-select types a constant's parameter
+as its target attribute's metamodel type where that is one a `Date` column reads, so a `Date` constant on a `DATE` or
+`TIME` attribute is not taken as a timestamp. Rejected: deriving the `java.sql` type in the processor from `@Temporal` (Hibernate's
+rules in a provider-neutral processor, blind to `orm.xml` and `@JavaType`, and models would have to declare `java.sql`
+types), as an optional processor module (a new SPI, and one model compiling two ways), and built-in converters from
+`Date` to each `java.sql` type (never chosen while both sides read `Date`; the `DATE` and `TIME` ones truncate, so
+they could not be ordered). A wrong `java.sql` model type stays a first-use `MQ1001`, not a compile error. → `api/10`
+R-COL-08, R-COL-17, AC-COL-28; `api/13` R-AGG-02.
+
+**D-123 — Fewer models, fewer calls (`generateInserts`, `one`, `first`, `one(q, key)`; RFC 0007).** `@QueryModel`
+gains `generateInserts`, the insert twin of `generateChanges`: it generates `INSERT_COLUMNS`, `insert`, `insertFrom`
+and `persist` on the query model, each `@Incubating`, so a screen that reads and creates one row shape keeps one
+model. It writes root columns only and leaves out `@Join`, `@Child`, `@Computed`, `@Selected`, `@Transient` and
+filter-only fields, to-one columns, version columns, columns an insert can't write and generated ids, listing each in
+the `INSERT_COLUMNS` Javadoc. It writes no foreign key: a query model cannot name one as a scalar (`MQ3002`, D-44), so
+a model that sets one keeps its own `@InsertModel`. `addKey` follows the root's id, not `@PrimaryKey`; a non-id
+`@PrimaryKey` is written with `add`. `MQ3505` refuses a grouped model or one with no writable root column;
+`MQ3503` is unchanged. The executor gains `one(q)`, `first(q)` and `one(q, key)`, and the repository `findOne`,
+`findFirst` and `findByKey`, delegate-only (R-SPR-01). `one` renders `list`'s statement with a limit of 2, throws
+`MQ2003` on a second row before the fetch plan runs, and counts `list` rows, so a predicate-only to-many join gives
+`MQ2003` naming the join and pointing at `Filters.exists`. `first` appends the key, or the group keys for a grouped
+query, as a tie-breaker after any `orderBy`, with explicit `nullsLast` only for a column that can be NULL (an
+`@Id` or non-optional column sorts plain ascending, so an index can serve `LIMIT 1`); neither an `orderBy` nor a key is `MQ2203`, except on
+an aggregate-only query, which has one row. A
+key passed to `one(q, key)` converts as in `whereKey`; a `null` key or component, or a wrong component count, throws
+`IllegalArgumentException`, and a keyless or grouped query is `MQ2203`. The methods are abstract on the `@Incubating`
+interfaces (R-REL-07, D-110), not defaults: a default on `list` would run the fetch plan on the extra row. Rejected:
+allowing `@QueryModel` and `@InsertModel` together (clashing generated members), writing foreign keys from a query
+model, `first` in natural order or without a tie-breaker (a different row per vendor), `one` at a limit of 1 (hides
+the duplicate) or deduplicating by key (hides a real second row, INV-5), a nullable return or a throwing `getOne`.
+Ships as 0.7.0 with D-122. → `rfc/0007`, `processor/30` R-PROC-26, `processor/31` R-GEN-34, `processor/32`
+(`MQ3501`, `MQ3504`, `MQ3505`), `api/11` R-QRY-03, `engine/20` R-EXE-12, `reference/90` (`MQ2003`, `MQ2203`),
+`integration/50` R-SPR-15, AC-SPR-18, `delivery/61` R-REL-07.
+
+**D-124 — Neither change set nor insert writes a to-one from a query model (amends D-70 and R-GEN-19; clarifies
+D-123).** A query model cannot name a foreign key as a scalar (`MQ3002`, D-44), so a column over a to-one holds the
+target entity, whole (`MQ3016`) or converted (`MQ3014`). The engine writes a to-one only by its id type (`MQ1001`), so
+the setter `generateChanges` generated for such a column could never succeed, nor could `from` copying it.
+`generateChanges` now leaves a to-one column out as `generateInserts` does, and the change set's Javadoc names it with
+the reason; the column is still read. An `@UpdateModel` or `@InsertModel` still writes a to-one by id (R-GEN-19,
+R-PROC-23). A model that writes a foreign key keeps one of those, or reads an entity that maps the column twice, the
+association `insertable = false, updatable = false` and a basic attribute beside it, which both flags write as a plain
+column. A whole-entity or converted to-one column (on the root, an `@Join`ed table or a child root, not inside an embedded
+value) is read through a LEFT join of the association in every clause of a read (`api/10` R-COL-25), never the implicit inner join of `root.get`, so a row with a `NULL` foreign key
+reads back with `null` rather than being dropped; a bulk write takes no join and is unchanged. A converter is never
+given that `null`. No new code and
+no opt-in: rejected are a `writeForeignKeys` member, a per-field opt-in, and cascading writes
+into `@Join` or `@Child` (deferred past 1.0 by D-118; D-14, INV-1, INV-5). → `processor/30` R-PROC-19, `processor/31`
+R-GEN-19, R-GEN-21, AC-PROC-20, AC-GEN-28, Q-14.
+
+**D-125 — Insert columns a database fills (`@Generated`, `@ExcludeFromInserts`; RFC 0008 §1-§2).** `generateInserts`
+wrote every writable root column, so a `null` overrode a `DEFAULT`. R-PROC-26 now also leaves out a non-id root column
+whose attribute carries `org.hibernate.annotations.Generated` with `writable = false`, an empty `sql` and `INSERT`
+among its events (its `value` when present and not `INSERT`, Hibernate 6, otherwise its `event`), read by full name
+with `getElementValuesWithDefaults`; an unresolved annotation type leaves the column written. Every timestamp
+annotation stays written: Hibernate writes a DB-sourced one itself, but an SQM insert applies only the id generator and
+the version seed, so leaving it out would write `NULL`. The new `@Incubating` field annotation `@ExcludeFromInserts`
+(R-PROC-27, `CLASS` retention, no elements, no constant) leaves any other column out of `INSERT_COLUMNS`, `insert`,
+`insertFrom` and `persist` while the model still reads it; the server-time recipe is `insert(rows).set(CREATED_AT,
+now)`. Under `persist` an excluded column gets the no-arg constructor's value. `MQ3506` refuses it on a model without
+`generateInserts`, on an `@UpdateModel` or `@InsertModel` (an accepted no-op would read as excluded while `NULL` is
+written; relaxing later is compatible, the reverse is not), and on a field R-PROC-26 already leaves out; on a
+`@Selected` field it is `MQ3021`, on a grouped model only `MQ3505` applies, and on an assigned id `MQ3501` gains a
+message. Declined: `@ExcludeFromChanges` (a change set writes only the fields set on it, and "read but never patch" is
+authorization, given by a per-endpoint `@UpdateModel`, R-PROC-19), a run-time `skipNulls` (P-3; per-row statement
+shapes break the batch and R-WRT-33's key order; SQLite), `InsertColumns#without`, a string list on `@QueryModel`,
+skipping every `@ValueGenerationType` or DB-sourced timestamp, and honouring `@ColumnDefault`. A 0.7.0 model whose
+entity has such a `@Generated` column stops writing it (`delivery/61`). Ships as 0.8.0 with D-126. → `rfc/0008`,
+`processor/30` R-PROC-26, R-PROC-27, `processor/31` R-GEN-34, `processor/32` (`MQ3501`, `MQ3021`, `MQ3506`),
+AC-PROC-21, AC-PROC-22, AC-GEN-29, AC-DIAG-13, AC-WRT-40.
+
+**D-126 — Reading many keys (`byKeys`, `findAllByKeys`; RFC 0008 §3).** The executor gains `byKeys(q, keys)` and the
+repository `findAllByKeys(q, keys)`, abstract and `@Incubating` (R-REL-07), returning an unmodifiable `Map<K, M>` in
+the keys' first-occurrence order; a key with no row, or one `q`'s filter excludes, is absent. Keys convert as in
+`whereKey`; rows are matched back by the converted attribute value, every distinct caller key that matched gets an
+entry (two keys converting to one value share one model, `afterMap` once), and a row matching no requested value (a
+case-insensitive or padding collation, a `BigDecimal` scale) is the new `MQ2005` rather than a silent drop. The keys
+are chunked as R-PAG-07 step 2 chunks its keys, without `primaryKeyFirstBatchSize` (`api/12` R-FLT-09's third
+library-built key list), each statement built in `Phase.MODEL` so a customizer filters it as it filters `one(q,
+key)`; `MODEL_BY_KEYS` would pass caller keys a tenant filter on `MODEL` should stop. All chunks are read and checked
+(`MQ2003` for a key matching two rows) before any row is mapped, and the fetch plan runs once. Checks before the
+empty-keys shortcut: `NullPointerException`, `MQ2203` (no primary key), then key conversion. An `orderBy` is ignored,
+no statement renders one (chunks can't be ordered across statements, and the map is in key order), and the call logs
+a `WARNING` once per `ModelQuery`, so one definition serves `list` and `byKeys`. `count`, `one(q)` and `one(q, key)`,
+which ignored an `orderBy` silently, now log the same way when called directly (not `page`'s own count), and both
+`one` methods stop rendering it (amends R-EXE-05, R-EXE-12). Primary-key-first's `readByKeys` is not reused as it
+stands, since it skips unmatched rows. Rejected: `List<M>` (missing keys silent), ordering within chunks (order
+changes past one chunk), refusing an `orderBy` (a `list` definition would need an unordered twin), ignoring it silently, overloading `one(q, Collection)` (a composite key is a `List`, a keyless query's key is
+`Object`), and translating `MQ2003` into Spring's `IncorrectResultSizeDataAccessException` (D-50, INV-8; the Spring
+guide shows a user-side `PersistenceExceptionTranslator` on `code()`). → `rfc/0008`, `engine/20` R-EXE-05, R-EXE-12, R-EXE-13,
+`integration/50` R-SPR-15, `api/11` R-QRY-03, R-QRY-10, `api/12` R-FLT-09, `api/15` R-FCH-05, `reference/90`
+(`MQ2003`, `MQ2005`, `MQ2203`), AC-EXE-14, AC-EXE-15, AC-SPR-19.
+
 ## 2. Open questions
 
 **Q-1 — Project name and coordinates.** Resolved by D-77.
@@ -1679,6 +1784,13 @@ detect it? → `api/14` R-WRT-11.
 (D-101); a test cannot read a child query's filters, order or `maxPerParent`, which sit behind the `@EngineFacing`
 `ChildLoad`. Should `FetchPlan` gain a public read-only view of its children, or should child queries be tested only
 against a database? → `api/16` R-INS-06, `api/15`.
+
+**Q-14 — Reading a to-one by id on a query model.** A query model reads a foreign key only through the whole entity
+(`MQ3016`), a converter, or an entity that maps the column twice (D-124). Should `@Column(attribute = "customer") Long
+customerId` read the id on a query model, as an update model writes it? Open: whether it renders a LEFT join or the
+foreign-key column, and a TCK case with a `NULL` foreign key on every vendor. Related: a `@GroupBy` on a whole-entity
+to-one column fails on PostgreSQL, since Hibernate groups by the foreign key but selects every entity column;
+whether that is a diagnostic or a group by the id is open. → D-44, D-124.
 
 ## 3. Risks
 

@@ -1,6 +1,6 @@
 # API stability
 
-model-query is at 0.6.0. Until 1.0.0 the public API may change in any minor release, and the commit that does it is
+model-query is at 0.8.0. Until 1.0.0 the public API may change in any minor release, and the commit that does it is
 marked breaking. From 1.0.0 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Today: everything is `@Incubating`
@@ -79,6 +79,22 @@ and `toString` are not marked and freeze with `SelectSet`. The freeze review mov
 The field-index members are new in 0.6.0 and `@Incubating` (D-121), and join the list above. They are `FieldIndex`, its
 `Builder` and `Resolution`, `AggregateField.named`, and the generated `fields()` method of every query model. See
 [Client-chosen fields](recipes.md#client-chosen-fields).
+
+The single-row and insert-from-query-model members are new in 0.7.0 and `@Incubating` (D-123), and join the list above.
+They are `ModelQueryExecutor.one`, `first` and `one(q, key)`, `@QueryModel.generateInserts` with the generated
+`INSERT_COLUMNS`, `insert`, `insertFrom` and `persist` it adds to a query model, and `ModelQueryRepository.findOne`,
+`findFirst` and `findByKey`. The executor methods are abstract, not defaults, so a class that implements
+`ModelQueryExecutor` itself must add them. See
+[One model for reading and creating](models.md#one-model-for-reading-and-creating) and
+[Reading one row](queries.md#reading-one-row).
+
+The insert-column and multi-key members are new in 0.8.0 and `@Incubating` (D-125, D-126), and join the list above.
+They are the `@ExcludeFromInserts` annotation and the `generateInserts` rules that leave out a non-writable
+`@Generated` column, `ModelQueryExecutor.byKeys` and `ModelQueryRepository.findAllByKeys`. `byKeys` is abstract, not a
+default, so a class that implements `ModelQueryExecutor` itself must add it. `PrimaryKey.attributeKey` is
+`@EngineFacing`, so it is not API. See
+[One model for reading and creating](models.md#one-model-for-reading-and-creating) and
+[Reading many keys](queries.md#reading-many-keys).
 
 The fetch-plan types are new in 0.2.0, `@Incubating`, and not yet placed in the 1.0 freeze list above:
 `FetchPlan`, `ChildField`, `JoinField`, `ChildQuery`, `Enricher` and the `@Child` annotation. The executor-facing

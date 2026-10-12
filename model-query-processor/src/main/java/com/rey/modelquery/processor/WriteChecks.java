@@ -13,9 +13,11 @@ import javax.lang.model.util.Types;
 /**
  * The checks of a model that writes: an {@code @UpdateModel}, a {@code @QueryModel} with
  * {@code generateChanges = true} ({@code MQ3301}..{@code MQ3307}), or an {@code @InsertModel} ({@code MQ3301},
- * {@code MQ3303}..{@code MQ3305} on its columns, {@code MQ3501}, {@code MQ3502} and {@code MQ3504}).
+ * {@code MQ3303}..{@code MQ3305} on its columns, {@code MQ3501}, {@code MQ3502} and {@code MQ3504}), or a
+ * {@code @QueryModel} with {@code generateInserts = true} ({@code MQ3501}, {@code MQ3504} and {@code MQ3505});
+ * {@code MQ3506} on any of them.
  *
- * @implSpec R-GEN-19, R-GEN-22, R-GEN-23, R-PROC-23, R-DIAG-01, R-DIAG-02
+ * @implSpec R-GEN-19, R-GEN-22, R-GEN-23, R-PROC-23, R-PROC-26, R-DIAG-01, R-DIAG-02
  */
 final class WriteChecks {
 
@@ -120,11 +122,7 @@ final class WriteChecks {
     void checkInsertKey(ModelDefinition model, Diagnostics diagnostics) {
         EntityMetamodel.Id id = metamodel.id(model.root());
         String root = model.root().getSimpleName().toString();
-        if (id.type() == null) {
-            diagnostics.warning(model.type(), DiagnosticCode.MQ3504, model.name() + ": " + root
-                    + " has no id type the processor can see; insert(rows) and persist(row) return its keys as "
-                    + "Object");
-        }
+        warnUntypedId(model, id, diagnostics);
         if (id.attributes().isEmpty()) {
             return;
         }
@@ -154,6 +152,90 @@ final class WriteChecks {
         if (!reported && !id.generated() && !id.is(keys)) {
             diagnostics.error(model.type(), DiagnosticCode.MQ3501, model.name() + ": " + root + "'s id " + id.label()
                     + " has no @GeneratedValue or generator annotation; name it with @PrimaryKey");
+        }
+    }
+
+    /**
+     * {@code MQ3505} for a {@code generateInserts} query model that is grouped or writes no root column; otherwise
+     * {@code MQ3501} only when the root's id is assigned and the columns written don't cover all of it (annotated
+     * {@code @PrimaryKey} or not), since {@code addKey} follows the id and another {@code @PrimaryKey} is written with
+     * {@code add}; and
+     * {@code MQ3504} as on an insert model (R-PROC-26, D-123).
+     */
+    void checkGeneratedInserts(ModelDefinition model, Diagnostics diagnostics) {
+        List<InsertedColumns.Written> written = InsertedColumns.of(model, metamodel).written();
+        if (model.grouped() || written.isEmpty()) {
+            diagnostics.error(model.type(), DiagnosticCode.MQ3505, model.name()
+                    + ": generateInserts needs an ungrouped model with at least one root column it can write");
+            // No insert member can be generated, so what would key it is beside the point.
+            return;
+        }
+        EntityMetamodel.Id id = metamodel.id(model.root());
+        warnUntypedId(model, id, diagnostics);
+        boolean excludedId = excludedAssignedId(model, id, diagnostics);
+        // Only a column the insert writes covers the id: a to-one @MapsId or insertable = false one is left out.
+        Set<String> columns = written.stream().filter(InsertedColumns.Written::key).map(column -> column.field()
+                .attribute()).collect(Collectors.toSet());
+        boolean covered = columns.containsAll(id.attributes())
+                || !id.components().isEmpty() && columns.containsAll(id.components());
+        if (!id.generated() && !covered && !excludedId) {
+            diagnostics.error(model.type(), DiagnosticCode.MQ3501, model.name() + ": "
+                    + model.root().getSimpleName() + "'s id " + id.label() + " has no @GeneratedValue or generator "
+                    + "annotation; generateInserts writes it, so map it in the model");
+        }
+    }
+
+    /**
+     * {@code MQ3501} on each {@code @ExcludeFromInserts} field that maps the root's assigned id, which the insert must
+     * write (D-125). Returns whether one was reported, so the general {@code MQ3501} does not repeat it.
+     */
+    private boolean excludedAssignedId(ModelDefinition model, EntityMetamodel.Id id, Diagnostics diagnostics) {
+        boolean reported = false;
+        for (ModelField field : model.fields()) {
+            if (!id.generated() && InsertedColumns.excluded(field) && field.column() && id.covers(field.attribute())
+                    && InsertedColumns.alreadyLeftOut(field, model, metamodel) == null) {
+                diagnostics.error(field.element(), DiagnosticCode.MQ3501, model.name() + "." + field.name()
+                        + " is @ExcludeFromInserts, but " + model.root().getSimpleName() + "'s id " + id.label()
+                        + " is assigned, so generateInserts must write it");
+                reported = true;
+            }
+        }
+        return reported;
+    }
+
+    /**
+     * {@code MQ3506} for an {@code @ExcludeFromInserts} that does nothing or is refused: on a model that doesn't
+     * generate inserts (a {@code @QueryModel} without {@code generateInserts}, an update or insert model), or on a
+     * field R-PROC-26 already leaves out. A {@code @Selected} field is {@code MQ3021}, and a grouped model has only
+     * {@code MQ3505} (R-PROC-27, D-125).
+     */
+    void checkExcluded(ModelDefinition model, Diagnostics diagnostics) {
+        boolean generates = model.queryModel() && model.generateInserts();
+        for (ModelField field : model.fields()) {
+            if (!InsertedColumns.excluded(field) || field.selected()) {
+                continue;
+            }
+            String where = model.name() + "." + field.name() + ": @ExcludeFromInserts ";
+            if (!generates) {
+                diagnostics.error(field.element(), DiagnosticCode.MQ3506,
+                        where + "needs generateInserts = true on the @QueryModel");
+            } else if (!model.grouped()) {
+                String reason = InsertedColumns.alreadyLeftOut(field, model, metamodel);
+                if (reason != null) {
+                    diagnostics.error(field.element(), DiagnosticCode.MQ3506,
+                            where + "does nothing; generateInserts already leaves it out ("
+                            + reason.replaceAll("\\{@code ([^}]*)\\}", "$1") + ")");
+                }
+            }
+        }
+    }
+
+    /** {@code MQ3504} when the processor sees no id type, so {@code insert} and {@code persist} type it Object. */
+    private static void warnUntypedId(ModelDefinition model, EntityMetamodel.Id id, Diagnostics diagnostics) {
+        if (id.type() == null) {
+            diagnostics.warning(model.type(), DiagnosticCode.MQ3504, model.name() + ": "
+                    + model.root().getSimpleName() + " has no id type the processor can see; insert(rows) and "
+                    + "persist(row) return its keys as Object");
         }
     }
 
@@ -194,7 +276,7 @@ final class WriteChecks {
                 diagnostics.error(model.type(), DiagnosticCode.MQ3306, model.name() + ": " + required);
             }
         }
-        for (ModelField field : model.writable()) {
+        for (ModelField field : ChangedColumns.of(model, metamodel).written()) {
             String where = model.name() + "." + field.name() + ": ";
             if (CHANGES_MEMBERS.contains(field.name())) {
                 diagnostics.error(field.element(), DiagnosticCode.MQ3307, where + "generates " + field.name() + "("
