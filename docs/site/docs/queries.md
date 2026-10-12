@@ -69,6 +69,82 @@ active.
 
 `count` is not inflated by collection joins: the engine uses `count(distinct root)` only when a to-many join exists.
 
+## Reading one row
+
+Three methods read at most one model and return an `Optional` (D-123, `@Incubating`):
+
+| Method | Meaning |
+|---|---|
+| `one(q)` | The single matching row, or empty. A second row throws `MQ2003`. |
+| `first(q)` | The first row in a stable order, or empty. Never `MQ2003`. |
+| `one(q, key)` | The row with that primary key that also matches `q`'s filter, or empty. |
+
+=== "Plain JPA"
+
+    ```java
+    Optional<OrderView> order = executor.one(q);
+    Optional<OrderView> newest = executor.first(q);
+    Optional<OrderView> byKey = executor.one(q, 42L);
+    ```
+
+=== "Spring repository"
+
+    ```java
+    Optional<OrderView> order = orders.findOne(q);
+    Optional<OrderView> newest = orders.findFirst(q);
+    Optional<OrderView> byKey = orders.findByKey(q, 42L);
+    ```
+
+`one` reads at a limit of 2, so a second row is found and not hidden; `MQ2003` is thrown before any row is mapped, and
+the [fetch plan](fetch-plans.md) runs once, on the one row left. `one` counts rows as `list` returns them, so a
+predicate-only to-many join can repeat the root row and give `MQ2003`. The message names the join; replace it with
+[`Filters.exists`](#exists), which joins nothing on the outer query.
+
+`first` orders by the query's `orderBy`, then by the primary key (the group keys, for a grouped query) wherever the
+`orderBy` does not already cover it, with `nullsLast` stated for those implicit columns. That tie-breaker makes the
+same row come back on every database, even when a group key is `NULL`. A query with neither an
+`orderBy` nor a key is `MQ2203`, an aggregate-only query excepted since it has one row. When the selection reads
+through a to-many join, the key spans several rows and the row `first` picks is not deterministic, as with offset
+paging.
+
+`one(q, key)` adds `primary key = key` to `q`'s filter, converting the key as `whereKey` does; contradictory filters
+give empty. A `null` key or component, or the wrong number of components for a composite key, throws
+`IllegalArgumentException`, a query without a primary key (or a grouped one) is `MQ2203`, and a `@PrimaryKey` on a
+non-id column that matches two rows is `MQ2003`. On a Spring repository the three are `findOne`, `findFirst` and
+`findByKey`; see [Spring Data](spring.md#the-repository).
+
+## Reading many keys
+
+`byKeys(q, keys)` reads the models of many primary keys at once and returns them as an unmodifiable `Map<K, M>`
+(D-126, `@Incubating`):
+
+=== "Plain JPA"
+
+    ```java
+    Map<Long, OrderView> byId = executor.byKeys(q, List.of(1L, 2L, 3L));
+    ```
+
+=== "Spring repository"
+
+    ```java
+    Map<Long, OrderView> byId = orders.findAllByKeys(q, List.of(1L, 2L, 3L));
+    ```
+
+The map iterates in the order of the keys' first occurrence, and a key with no row — or one `q`'s filter excludes — is
+absent rather than a `null` entry. Each key is converted as `whereKey` converts it, so two keys a converter maps to
+one value share one model, read once, and rows are matched back by the converted attribute value. A key that matches
+two rows is `MQ2003`, as `one(q, key)` gives; a row whose key equals none of the requested values is `MQ2005`, naming
+the value, before any row is mapped. That happens when the column's collation is case-insensitive or ignores trailing
+spaces, or a `BigDecimal` key has a different scale, so the row the database matched is not one the caller asked for.
+`keys` may be larger than the vendor's limits: the library spreads them over as many statements as the bind limits
+allow, and each key is read in exactly one. No keys return an empty map and run no SQL.
+
+`byKeys` ignores the query's `orderBy`, since the map is in key order; a call on an ordered query logs one `WARNING`,
+`<Model>: byKeys(query, keys) ignores the query's orderBy; the map is in key order`. `count(q)`, `one(q)` and
+`one(q, key)` ignore an `orderBy` the same way and log one `WARNING` each; the two `one` statements render no
+`ORDER BY`. `first` uses the order and is unchanged. On a Spring repository `byKeys` is `findAllByKeys`; see
+[Spring Data](spring.md#the-repository).
+
 ## Filters
 
 `where` hands you a `Filters` builder that ANDs every filter you add. Every method that takes a value has two forms:

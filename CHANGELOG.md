@@ -4,7 +4,85 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html); the public API may change in any `0.x`
 release (`docs/spec/delivery/61-repo-release-governance.md` R-REL-07).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-09
+
+Nothing is frozen yet: every public type stays `@Incubating`, and the freeze review moves to a later milestone. The
+additions below are all `@Incubating`. Two behaviour changes (see the upgrade notes) change the SQL a 0.7.0 model
+writes.
+
+### Added
+- Insert columns a database fills (D-125, RFC 0008), described in "One model for reading and creating":
+  - `@QueryModel(generateInserts = true)` leaves out a non-id root column whose attribute carries Hibernate's
+    `@Generated` with `writable = false`, an empty `sql` and `INSERT` among its events: the database fills it, and a
+    computed `GENERATED ALWAYS AS` column refuses a value. `@Generated(writable = true)`, `@Generated(sql = …)`,
+    `@Generated(event = UPDATE)` and every timestamp annotation stay written.
+  - The new `@ExcludeFromInserts` annotation leaves any other column — a plain `DEFAULT` clause — out of
+    `INSERT_COLUMNS`, `insert`, `insertFrom` and `persist` while the model still reads it, so a server-set column uses
+    `insert(rows).set(CREATED_AT, now)`. `MQ3506` refuses it where it does nothing.
+- Reading many keys (D-126, RFC 0008), described in "Reading many keys":
+  - `ModelQueryExecutor.byKeys(q, keys)` reads many primary keys into an unmodifiable `Map<K, M>` in the keys'
+    first-occurrence order, with a missing key absent. Keys are chunked as `whereKeys` spreads its keys; a key matching
+    two rows is `MQ2003`, and the new `MQ2005` names a row that matches no requested value.
+  - `ModelQueryRepository.findAllByKeys(q, keys)` delegates to it.
+- `MQ2005` and `MQ3506`, and `MQ3501`'s message for an `@ExcludeFromInserts` field that is an assigned id.
+
+### Changed
+- A 0.7.0 `generateInserts` model whose entity has a non-writable `@Generated` insert column stops writing that column:
+  under `insert` a value the caller set on it is dropped, as `persist` already dropped it; a `GENERATED ALWAYS AS`
+  column that failed loudly under 0.7.0 now works.
+- `count(q)`, `one(q)` and `one(q, key)` on an ordered query log one `WARNING` per `ModelQuery`, which they did not
+  before, and both `one` statements render no `ORDER BY`.
+
+### Upgrade notes
+- `byKeys(q, keys)` is abstract on `ModelQueryExecutor`, like `one` and `first`. A class that implements
+  `ModelQueryExecutor` itself (a decorator or test double) must add it; one compiled before 0.8.0 throws
+  `AbstractMethodError` only when `byKeys` is called.
+- A model whose entity maps a non-writable `@Generated` insert column now drops that column from its inserts, so a
+  value set on it under `insert` no longer reaches the database. Name the column in an `@InsertModel` if it must be
+  written.
+
+## [0.7.0] - 2026-10-09
+
+Nothing is frozen yet: every public type stays `@Incubating`. No existing API changes incompatibly except for classes
+that implement `ModelQueryExecutor` themselves (see the upgrade notes); the additions below are all `@Incubating`.
+
+### Added
+- Fewer models, fewer calls (D-123, RFC 0007), described in "One model for reading and creating" and "Reading one row":
+  - `@QueryModel(generateInserts = true)` generates `INSERT_COLUMNS`, `insert`, `insertFrom` and `persist` on a query
+    model, over its root columns. It leaves out joins, children, computed, selected and transient fields, filter-only
+    columns, to-one columns, version columns, columns an insert cannot write and generated ids, and the `INSERT_COLUMNS`
+    Javadoc names each. `addKey` follows the root's id. `MQ3505` for a grouped model or one with no writable root
+    column.
+  - `ModelQueryExecutor.one(q)`, `first(q)` and `one(q, key)`, each an `Optional`. `one` reads at a limit of 2 and
+    throws `MQ2003` on a second row before the fetch plan runs; through a predicate-only to-many join the message
+    points at `Filters.exists`. `first` orders by the `orderBy`, then the key (group keys for a grouped query) with
+    `nullsLast` where the key can be `NULL`, so every database returns the same row. `one(q, key)` ANDs the key with the filter.
+  - `ModelQueryRepository.findOne`, `findFirst` and `findByKey`, delegating to the three executor methods.
+
+### Changed
+- A query model's generated change set and inserts leave a to-one column out (D-124): a query model cannot name a
+  foreign key as a scalar, so the setter could never succeed. The change set's Javadoc names the column and the reason.
+  `@UpdateModel` and `@InsertModel` still write a to-one by id.
+- A whole-entity or converted to-one column on the root reads through a `LEFT` join of the association, so a row
+  with a `NULL` foreign key comes back with `null` instead of being dropped. A filter on a to-one column now adds that
+  `LEFT` join, and a keyset export ordered by a to-one column now sees the `NULL`-foreign-key rows, so it throws
+  `MQ2202` unless the order sets `nullsFirst` or `nullsLast` (they used to be silently dropped).
+
+### Fixed
+
+- A model field declared `java.util.Date` over an entity attribute declared `java.util.Date` compiled and then failed
+  `MQ1001` at first use on Hibernate, which reports such an attribute as `java.sql.Date`, `Time` or `Timestamp`. A
+  `Date` column now matches all three (D-122), as do a `Date` `Expr.coalesce` (`MQ1507`) and `Agg.of` (`MQ1405`), and
+  each of the three codes names both types in full when their simple names are equal.
+  An insert-select `set` of a `Date` on a `DATE` or `TIME` attribute now binds as that attribute's type rather than a
+  timestamp, which Hibernate refused.
+
+### Upgrade notes
+- `one`, `first` and `one(q, key)` are abstract on `ModelQueryExecutor`, as a default built on `list` would run the
+  fetch plan on the extra row. A class that implements `ModelQueryExecutor` itself (a decorator or test double) must add
+  the three methods; one compiled before 0.7.0 throws `AbstractMethodError` when a new method is called.
+- A query model with `generateChanges = true` and a to-one column no longer gets a setter for it, so a call to that
+  setter stops compiling. Write the foreign key through an `@UpdateModel`.
 
 ## [0.6.0] - 2026-10-08
 

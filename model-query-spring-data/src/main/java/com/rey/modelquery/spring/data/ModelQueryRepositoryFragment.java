@@ -15,7 +15,9 @@ import com.rey.modelquery.core.PageSpec;
 import com.rey.modelquery.core.Slice;
 import com.rey.modelquery.core.ValuesInsert;
 import com.rey.modelquery.jpa.ModelQueryExecutor;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -89,6 +91,26 @@ final class ModelQueryRepositoryFragment<E> implements ModelQueryRepository<E> {
     @Override
     public long count(ModelQuery<E, ?, ?> q) {
         return executor.get().count(q);
+    }
+
+    @Override
+    public <M> Optional<M> findOne(ModelQuery<E, ?, M> q) {
+        return executor.get().one(q);
+    }
+
+    @Override
+    public <M> Optional<M> findFirst(ModelQuery<E, ?, M> q) {
+        return executor.get().first(q);
+    }
+
+    @Override
+    public <K, M> Optional<M> findByKey(ModelQuery<E, K, M> q, K key) {
+        return executor.get().one(q, key);
+    }
+
+    @Override
+    public <K, M> Map<K, M> findAllByKeys(ModelQuery<E, K, M> q, Collection<? extends K> keys) {
+        return executor.get().byKeys(q, keys);
     }
 
     @Override

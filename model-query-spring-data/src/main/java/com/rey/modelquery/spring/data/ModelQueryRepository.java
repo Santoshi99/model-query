@@ -15,7 +15,10 @@ import com.rey.modelquery.core.PageSpec;
 import com.rey.modelquery.core.SortSpec;
 import com.rey.modelquery.core.ValuesInsert;
 import com.rey.modelquery.jpa.ModelQueryExecutor;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -30,7 +33,7 @@ import org.springframework.data.domain.Sort;
  * (R-SPR-01, INV-8).
  *
  * @param <E> the root entity type, the repository's domain type
- * @implSpec R-SPR-01, R-SPR-02, R-SPR-03, R-SPR-10, R-SPR-12, R-SPR-14
+ * @implSpec R-SPR-01, R-SPR-02, R-SPR-03, R-SPR-10, R-SPR-12, R-SPR-14, R-SPR-15
  */
 @Incubating
 public interface ModelQueryRepository<E> {
@@ -71,6 +74,53 @@ public interface ModelQueryRepository<E> {
 
     /** {@link ModelQueryExecutor#count(ModelQuery)}. */
     long count(ModelQuery<E, ?, ?> q);
+
+    /**
+     * {@link ModelQueryExecutor#one(ModelQuery)}: the one row of {@code q}, or empty (R-SPR-15). It overloads Spring
+     * Data's {@code findOne(Example)} and {@code findOne(Specification)}, which a repository may also extend; each call
+     * resolves to one of them, and only a bare {@code null} is ambiguous.
+     *
+     * @throws com.rey.modelquery.core.ModelQueryExecutionException {@code MQ2003} when {@code q} has a second row
+     */
+    @Incubating
+    <M> Optional<M> findOne(ModelQuery<E, ?, M> q);
+
+    /**
+     * {@link ModelQueryExecutor#first(ModelQuery)}: the first row of {@code q} in a stable order, or empty (R-SPR-15).
+     *
+     * @throws com.rey.modelquery.core.ModelQueryExecutionException {@code MQ2203} for a query with neither an
+     *     {@code orderBy} nor a key, unless it only aggregates
+     */
+    @Incubating
+    <M> Optional<M> findFirst(ModelQuery<E, ?, M> q);
+
+    /**
+     * {@link ModelQueryExecutor#one(ModelQuery, Object)}: the row of {@code q} whose primary key is {@code key}, or
+     * empty (R-SPR-15).
+     *
+     * @throws IllegalArgumentException for a {@code null} key or component, or a composite key with the wrong number
+     *     of components
+     * @throws com.rey.modelquery.core.ModelQueryExecutionException {@code MQ2203} for a query without a primary key,
+     *     a grouped one included; {@code MQ2003} when a non-id primary key matches two rows
+     */
+    @Incubating
+    <K, M> Optional<M> findByKey(ModelQuery<E, K, M> q, K key);
+
+    /**
+     * {@link ModelQueryExecutor#byKeys(ModelQuery, Collection)}: the models of {@code keys} by key, an unmodifiable
+     * map in the keys' first-occurrence order, a key with no row absent (R-SPR-15). The call returns the executor's
+     * map unchanged and adds no semantics of its own (R-SPR-01): an {@code MQ2003} or {@code MQ2005} failure is the
+     * executor's {@code ModelQueryExecutionException}, not a Spring exception (D-126, INV-8).
+     *
+     * @throws NullPointerException for a {@code null} {@code q} or {@code keys}
+     * @throws IllegalArgumentException for a {@code null} key or component, or a composite key with the wrong number
+     *     of components
+     * @throws com.rey.modelquery.core.ModelQueryExecutionException {@code MQ2203} for a query without a primary key,
+     *     a grouped one included; {@code MQ2003} when a key matches two rows; {@code MQ2005} when a row's key equals
+     *     none of the requested values
+     */
+    @Incubating
+    <K, M> Map<K, M> findAllByKeys(ModelQuery<E, K, M> q, Collection<? extends K> keys);
 
     /**
      * {@link ModelQueryExecutor#stream(ModelQuery, Limit, Function)} inside a read-only transaction of the

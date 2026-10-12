@@ -26,6 +26,12 @@ import com.rey.modelquery.jpa.vendor.VendorResolver;
 import com.rey.modelquery.sample.springboot.h2.BookEntity;
 import com.rey.modelquery.sample.springboot.h2.BookRepository;
 import com.rey.modelquery.sample.springboot.h2.BookView;
+import com.rey.modelquery.sample.springboot.h2.ItemView;
+import com.rey.modelquery.sample.springboot.h2.OrderEntity;
+import com.rey.modelquery.sample.springboot.h2.OrderItemEntity;
+import com.rey.modelquery.sample.springboot.h2.OrderItemRepository;
+import com.rey.modelquery.sample.springboot.h2.OrderRepository;
+import com.rey.modelquery.sample.springboot.h2.OrderWithItems;
 import com.rey.modelquery.sample.springboot.h2.ProfileEntity;
 import com.rey.modelquery.sample.springboot.h2.ProfileRepository;
 import com.rey.modelquery.sample.springboot.h2.QBookView;
@@ -320,8 +326,45 @@ class SampleApplicationTest {
         }
     }
 
+    @Test
+    void ac_spr_14_the_order_keyset_page_endpoint_returns_orders_with_items() throws Exception {
+        try (ConfigurableApplicationContext context = startSample(List.of())) {
+            List<OrderEntity> orders = List.of(new OrderEntity(1L, "PAID", "120.00"),
+                    new OrderEntity(2L, "PAID", "35.50"), new OrderEntity(3L, "NEW", "80.00"),
+                    new OrderEntity(4L, "PAID", "12.25"), new OrderEntity(5L, "NEW", "60.00"));
+            context.getBean(OrderRepository.class).saveAll(orders);
+            context.getBean(OrderItemRepository.class).saveAll(List.of(
+                    new OrderItemEntity(1L, orders.get(0), "KEYBOARD", 1),
+                    new OrderItemEntity(2L, orders.get(0), "MOUSE", 2),
+                    new OrderItemEntity(3L, orders.get(1), "MOUSE", 1),
+                    new OrderItemEntity(4L, orders.get(2), "KEYBOARD", 3),
+                    new OrderItemEntity(5L, orders.get(3), "CABLE", 5),
+                    new OrderItemEntity(6L, orders.get(4), "MOUSE", 1)));
+            MockMvc mvc = MockMvcBuilders.standaloneSetup(context.getBean("orderController")).build();
+
+            OrderKeysetResponse first = getOrderPage(mvc, "/orders/pages?size=2");
+            assertThat(orderIds(first)).containsExactly(1L, 2L);
+            assertThat(first.orders().get(0).items()).extracting(ItemView::sku).containsExactly("KEYBOARD", "MOUSE");
+            assertThat(first.previous()).isNull();
+            assertThat(first.next()).isNotNull();
+
+            OrderKeysetResponse second = getOrderPage(mvc, "/orders/pages?size=2&after=" + first.next());
+            assertThat(orderIds(second)).containsExactly(3L, 4L);
+            assertThat(second.previous()).isNotNull();
+            assertThat(second.next()).isNotNull();
+
+            OrderKeysetResponse back = getOrderPage(mvc, "/orders/pages?size=2&before=" + second.previous());
+            assertThat(orderIds(back)).containsExactly(1L, 2L);
+            assertThat(back.previous()).isNull();
+            assertThat(back.next()).isNotNull();
+        }
+    }
+
     /** A keyset page the endpoint answered with, deserialized from its JSON. */
     record KeysetResponse(List<BookView> books, String next, String previous) {}
+
+    /** An order keyset page the endpoint answered with, deserialized from its JSON. */
+    record OrderKeysetResponse(List<OrderWithItems> orders, String next, String previous) {}
 
     /** The page {@code url} answers with, asserting a 200. */
     private static KeysetResponse getPage(MockMvc mvc, String url) throws Exception {
@@ -329,8 +372,18 @@ class SampleApplicationTest {
         return new ObjectMapper().readValue(json, KeysetResponse.class);
     }
 
+    /** The order page {@code url} answers with, asserting a 200. */
+    private static OrderKeysetResponse getOrderPage(MockMvc mvc, String url) throws Exception {
+        String json = mvc.perform(get(url)).andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        return new ObjectMapper().readValue(json, OrderKeysetResponse.class);
+    }
+
     private static List<Long> ids(KeysetResponse page) {
         return page.books().stream().map(BookView::id).toList();
+    }
+
+    private static List<Long> orderIds(OrderKeysetResponse page) {
+        return page.orders().stream().map(OrderWithItems::id).toList();
     }
 
     /** The field errors a PATCH of {@code body} to book 1 answers with a 400. */

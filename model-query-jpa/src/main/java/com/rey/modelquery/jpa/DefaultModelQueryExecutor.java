@@ -63,7 +63,9 @@ import jakarta.persistence.criteria.CriteriaUpdate;
 import jakarta.persistence.criteria.Expression;
 import jakarta.persistence.criteria.From;
 import jakarta.persistence.criteria.Join;
+import jakarta.persistence.criteria.JoinType;
 import jakarta.persistence.criteria.Order;
+import jakarta.persistence.criteria.ParameterExpression;
 import jakarta.persistence.criteria.Path;
 import jakarta.persistence.criteria.Predicate;
 import jakarta.persistence.criteria.Selection;
@@ -75,13 +77,18 @@ import jakarta.persistence.metamodel.PluralAttribute;
 import jakarta.persistence.metamodel.SingularAttribute;
 import java.lang.reflect.AnnotatedElement;
 import java.sql.SQLException;
+import java.sql.Time;
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -144,6 +151,10 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
     /** The factories {@code stream} warned of setting no fetch size on, so each is warned of once (R-VND-12). */
     private static final Set<EntityManagerFactory> FETCH_SIZE_UNSET =
             Collections.newSetFromMap(Collections.synchronizedMap(new WeakHashMap<>()));
+
+    /** The calls, per query, that warned of an ignored {@code orderBy}, so each is warned of once (R-EXE-13). */
+    private static final Map<ModelQuery<?, ?, ?>, Set<String>> ORDER_IGNORED =
+            Collections.synchronizedMap(new WeakHashMap<>());
 
     /** The mapped entity classes of each factory, read from its metamodel once; weak, so a closed factory is freed. */
     private static final Map<EntityManagerFactory, Set<Class<?>>> MAPPED_ENTITIES =
@@ -226,6 +237,207 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
         }
         BuiltQuery<M> built = q.buildQuery(em.getCriteriaBuilder(), Phase.MODEL, renderOptions);
         return models(q, mapAll(q, limited(q, built, limit), built));
+    }
+
+    // ---- single-row reads
+
+    @Override
+    public <M> Optional<M> one(ModelQuery<E, ?, M> q) {
+        Objects.requireNonNull(q, "q");
+        checkFirstRun(q);
+        LOG.log(DEBUG, () -> "one " + q);
+        warnOfIgnoredOrder(q, "one(query)");
+        BuiltQuery<M> built = q.buildQuery(em.getCriteriaBuilder(), Phase.MODEL, renderOptions);
+        built.query().orderBy(List.<Order>of()); // at most one row is read, so no order (R-EXE-12)
+        return atMostOne(q, built, "one(query)");
+    }
+
+    @Override
+    public <M> Optional<M> first(ModelQuery<E, ?, M> q) {
+        Objects.requireNonNull(q, "q");
+        checkFirstRun(q);
+        LOG.log(DEBUG, () -> "first " + q);
+        List<? extends SelectField<M, ?>> tieBreakers = tieBreakers(q);
+        // A grouped query without group keys only aggregates, so it has exactly one row to choose.
+        if (q.orderBy().isEmpty() && tieBreakers.isEmpty() && !q.isGrouped()) {
+            throw new ModelQueryExecutionException(MqCode.MQ2203, q + ": first(query) needs an orderBy or a "
+                    + "primary key to choose the same row on every database");
+        }
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        BuiltQuery<M> built = q.buildQuery(cb, Phase.MODEL, renderOptions);
+        // The key closes the order; a column that can be NULL sorts NULLs last on every vendor (R-EXE-12, INV-6).
+        List<Order> orders = new ArrayList<>(built.query().getOrderList());
+        for (SelectField<M, ?> column : tieBreakers) {
+            if (!isOrdered(q, column)) {
+                OrderField<M, ?> order = mayBeNull(column, built.joins()) ? column.asc().nullsLast() : column.asc();
+                orders.addAll(order.toOrders(built.joins(), cb, q.isGrouped()));
+            }
+        }
+        built.query().orderBy(orders);
+        TypedQuery<Tuple> query = create(q, built);
+        query.setMaxResults(1);
+        return modelOf(q, built, rows(q, query));
+    }
+
+    @Override
+    public <K, M> Optional<M> one(ModelQuery<E, K, M> q, K key) {
+        Objects.requireNonNull(q, "q");
+        if (key == null) {
+            throw new IllegalArgumentException(q + ": one(query, key) needs a key, and it is null");
+        }
+        checkFirstRun(q);
+        LOG.log(DEBUG, () -> "one " + q + " by key");
+        PrimaryKey<M, K> primaryKey = q.primaryKey().orElseThrow(() -> new ModelQueryExecutionException(
+                MqCode.MQ2203, q + ": one(query, key) needs a primary key to filter on, and " + (q.isGrouped()
+                        ? "a grouped query has none" : "primaryKey(...) was not set")));
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        warnOfIgnoredOrder(q, "one(query, key)");
+        BuiltQuery<M> built = q.buildQuery(cb, Phase.MODEL, renderOptions);
+        built.query().orderBy(List.<Order>of()); // at most one row is read, so no order (R-EXE-12)
+        Predicate byKey = primaryKey.equal(key, built.joins(), cb);
+        Predicate own = built.query().getRestriction();
+        built.query().where(own == null ? byKey : cb.and(own, byKey));
+        return atMostOne(q, built, "one(query, key)");
+    }
+
+    /** Warns once per query and call that {@code call} ignores {@code q}'s {@code orderBy} (R-EXE-05, R-EXE-13). */
+    private void warnOfIgnoredOrder(ModelQuery<?, ?, ?> q, String call) {
+        if (q.orderBy().isEmpty()) {
+            return;
+        }
+        boolean first;
+        synchronized (ORDER_IGNORED) {
+            first = ORDER_IGNORED.computeIfAbsent(q, key -> new HashSet<>()).add(call);
+        }
+        if (first) {
+            LOG.log(System.Logger.Level.WARNING, "{0}: {1} ignores the query''s orderBy{2}", q, call,
+                    call.startsWith("byKeys") ? "; the map is in key order" : "");
+        }
+    }
+
+    // ---- reads by many keys
+
+    @Override
+    public <K, M> Map<K, M> byKeys(ModelQuery<E, K, M> q, Collection<? extends K> keys) {
+        Objects.requireNonNull(q, "q");
+        Objects.requireNonNull(keys, "keys");
+        checkFirstRun(q);
+        LOG.log(DEBUG, () -> "byKeys " + q + ": " + keys.size() + " keys");
+        PrimaryKey<M, K> primaryKey = q.primaryKey().orElseThrow(() -> new ModelQueryExecutionException(
+                MqCode.MQ2203, q + ": byKeys(query, keys) needs a primary key to filter on, and " + (q.isGrouped()
+                        ? "a grouped query has none" : "primaryKey(...) was not set")));
+        // Each caller key to the attribute value it matches by (R-COL-11); keys converting to one value share a row.
+        Map<K, Object> converted = new LinkedHashMap<>();
+        for (K key : keys) {
+            if (!converted.containsKey(key)) {
+                converted.put(key, primaryKey.attributeKey(key));
+            }
+        }
+        if (converted.isEmpty()) {
+            return Map.of();
+        }
+        warnOfIgnoredOrder(q, "byKeys(query, keys)");
+        Set<Object> requested = new LinkedHashSet<>(converted.values());
+        List<Object> distinct = List.copyOf(requested);
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        // The statement's own binds, before any key is added; primaryKeyFirstBatchSize does not apply (R-EXE-13).
+        BuiltQuery<M> counted = q.buildQuery(cb, Phase.MODEL, renderOptions);
+        int ownBinds = em.createQuery(counted.query()).getParameters().size()
+                + counted.joins().repeatedExpressionBinds();
+        int chunk = keyLimits.clamp(ownBinds, primaryKey.columns().size(), OptionalInt.empty());
+        Map<Object, ReadRow<M>> found = new HashMap<>();
+        for (int from = 0; from < distinct.size(); from += chunk) {
+            List<Object> chunkKeys = distinct.subList(from, Math.min(distinct.size(), from + chunk));
+            BuiltQuery<M> built = q.buildQuery(cb, Phase.MODEL, renderOptions);
+            Predicate byKey = primaryKey.in(chunkKeys, built.joins(), cb, false);
+            Predicate own = built.query().getRestriction();
+            built.query().where(own == null ? byKey : cb.and(own, byKey));
+            built.query().orderBy(List.<Order>of()); // chunks cannot be ordered across statements (R-EXE-13)
+            for (Tuple tuple : rows(q, create(q, built))) {
+                Row row = built.selection().row(tuple);
+                Object rowKey = Keys.keyOf(q, primaryKey, row);
+                if (!requested.contains(rowKey)) {
+                    throw new ModelQueryExecutionException(MqCode.MQ2005, q + ": byKeys(query, keys) read a row whose "
+                            + "key " + rowKey + " equals none of the requested keys, as a case-insensitive or padding "
+                            + "collation, or a BigDecimal scale, can match; compare the key as the database does");
+                }
+                if (found.putIfAbsent(rowKey, new ReadRow<>(built, row)) != null) {
+                    throw new ModelQueryExecutionException(MqCode.MQ2003, q + ": byKeys(query, keys) found more than "
+                            + "one row for key " + rowKey + filterOnlyToManyJoin(built).map(join -> "; if the to-many "
+                                    + "join " + joinName(join) + ", which no selected column reads, repeats the row "
+                                    + "once per matching child, filter with Filters.exists(...) instead").orElse(""));
+                }
+            }
+        }
+        // Every chunk is read and checked; only now are rows mapped, in key order, and the fetch plan run once.
+        List<Object> foundValues = new ArrayList<>(found.size());
+        List<Loaded<M>> rows = new ArrayList<>(found.size());
+        for (Object value : distinct) {
+            ReadRow<M> row = found.get(value);
+            if (row != null) {
+                foundValues.add(value);
+                rows.add(new Loaded<>(row.built().map(row.row()), row.row()));
+            }
+        }
+        List<M> models = models(q, rows);
+        Map<Object, M> byValue = new HashMap<>();
+        for (int i = 0; i < foundValues.size(); i++) {
+            byValue.put(foundValues.get(i), models.get(i));
+        }
+        Map<K, M> result = new LinkedHashMap<>();
+        converted.forEach((key, value) -> {
+            M model = byValue.get(value);
+            if (model != null) {
+                result.put(key, model);
+            }
+        });
+        return Collections.unmodifiableMap(result);
+    }
+
+    /**
+     * The model of {@code built}'s one row, or empty. It reads at a limit of 2, and a second row throws {@code MQ2003}
+     * before any row is mapped, so neither {@code afterMap} nor the fetch plan sees it (R-EXE-12).
+     */
+    private <M> Optional<M> atMostOne(ModelQuery<E, ?, M> q, BuiltQuery<M> built, String call) {
+        TypedQuery<Tuple> query = create(q, built);
+        query.setMaxResults(2);
+        List<Tuple> tuples = rows(q, query);
+        if (tuples.size() > 1) {
+            throw new ModelQueryExecutionException(MqCode.MQ2003, q + ": " + call + " found more than one row"
+                    + filterOnlyToManyJoin(built).map(join -> "; if the to-many join " + joinName(join) + ", which no "
+                            + "selected column reads, repeats the row once per matching child, filter with "
+                            + "Filters.exists(...) instead").orElse(""));
+        }
+        return modelOf(q, built, tuples);
+    }
+
+    /** The model of the first of {@code tuples}, with {@code q}'s fetch plan run on it, or empty for none. */
+    private <M> Optional<M> modelOf(ModelQuery<E, ?, M> q, BuiltQuery<M> built, List<Tuple> tuples) {
+        return tuples.isEmpty() ? Optional.empty()
+                : Optional.of(models(q, List.of(loaded(built, tuples.get(0)))).get(0));
+    }
+
+    /**
+     * A to-many join of {@code built} that no selected column is read through, the one that repeats a root row once
+     * per matching child when only a filter reads it (R-EXE-04, R-EXE-12); empty when there is none.
+     */
+    private static Optional<Join<?, ?>> filterOnlyToManyJoin(BuiltQuery<?> built) {
+        Set<Join<?, ?>> selectedThrough = Collections.newSetFromMap(new IdentityHashMap<>());
+        selectedThrough.addAll(selectedToManyJoins(built));
+        return toManyJoinOutside(built.query().getRoots().iterator().next(), selectedThrough);
+    }
+
+    private static Optional<Join<?, ?>> toManyJoinOutside(From<?, ?> from, Set<Join<?, ?>> selectedThrough) {
+        for (Join<?, ?> join : from.getJoins()) {
+            if (join.getAttribute() instanceof PluralAttribute<?, ?, ?> && !selectedThrough.contains(join)) {
+                return Optional.of(join);
+            }
+            Optional<Join<?, ?>> nested = toManyJoinOutside(join, selectedThrough);
+            if (nested.isPresent()) {
+                return nested;
+            }
+        }
+        return Optional.empty();
     }
 
     @Override
@@ -587,6 +799,7 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
         Objects.requireNonNull(q, "q");
         checkFirstRun(q, false);
         LOG.log(DEBUG, () -> "count " + q);
+        warnOfIgnoredOrder(q, "count(query)");
         return countRows(q);
     }
 
@@ -924,8 +1137,9 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
             }
         }
         List<String> inserted = attributes;
-        Map<String, Object> bound = constants;
-        BuiltQuery<?> select = i.buildSelect(cb, renderOptions);
+        Metamodel metamodel = em.getMetamodel();
+        BuiltQuery<?> select = i.buildSelect(cb, renderOptions, metamodel);
+        Map<String, Object> bound = asParameterTypes(constants, select.query());
         int repeated = select.joins().repeatedExpressionBinds();
         BiFunction<EntityManager, CriteriaQuery<Tuple>, Query> statement = (on, source) ->
                 support.insertSelect(on, rootEntity, inserted, source, bound);
@@ -935,15 +1149,34 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
         if (i.chunkOptions().isEmpty()) {
             return write(i.persistenceContext(), () -> execute(whole.get(), repeated));
         }
-        PrimaryKey<Object, ?> key = i.sourceKey(em.getMetamodel());
+        PrimaryKey<Object, ?> key = i.sourceKey(metamodel);
         BiFunction<EntityManager, List<Object>, Query> byKeys = (on, keys) -> statement.apply(on,
-                selecting(i.buildSelect(cb, renderOptions, key, keys).query(), cb, added));
+                selecting(i.buildSelect(cb, renderOptions, metamodel, key, keys).query(), cb, added));
         // The source keys are attribute values of plain id columns, which is what the exception reports (R-WRT-32).
         var keyed = new KeysetWrite.Keyed<>(rootEntity.getSimpleName(), key, Optional.empty(),
                 run -> i.buildKeySelect(cb, renderOptions, key),
                 (on, keys) -> execute(byKeys.apply(on, keys), repeated), Optional.empty(), sourceKey -> sourceKey);
         return write(i.persistenceContext(), () -> keyset(keyed, whole, keys -> byKeys.apply(em, keys),
                 i.chunkOptions(), cb, repeated));
+    }
+
+    /**
+     * {@code constants} with each plain {@code java.util.Date} made the {@code java.sql} type its parameter in
+     * {@code select} is typed as, which a provider may require of the value it binds (Hibernate 7 does, D-122).
+     */
+    private static Map<String, Object> asParameterTypes(Map<String, Object> constants, CriteriaQuery<?> select) {
+        var bound = new LinkedHashMap<>(constants);
+        for (ParameterExpression<?> parameter : select.getParameters()) {
+            if (bound.get(parameter.getName()) instanceof Date date) {
+                Class<?> type = parameter.getParameterType();
+                long time = date.getTime();
+                bound.put(parameter.getName(), type == java.sql.Date.class && !(date instanceof java.sql.Date)
+                        ? new java.sql.Date(time)
+                        : type == Time.class && !(date instanceof Time) ? new Time(time)
+                        : type == Timestamp.class && !(date instanceof Timestamp) ? new Timestamp(time) : date);
+            }
+        }
+        return bound;
     }
 
     /**
@@ -1196,8 +1429,8 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
     private Set<Class<?>> selected(ModelInsert<E, ?> i, Metamodel metamodel) {
         Set<Class<?>> entities = mappedEntities(em);
         var selected = new LinkedHashSet<Class<?>>();
-        var froms = new ArrayDeque<From<?, ?>>(i.buildSelect(em.getCriteriaBuilder(), renderOptions).query()
-                .getRoots());
+        var froms = new ArrayDeque<From<?, ?>>(i.buildSelect(em.getCriteriaBuilder(), renderOptions, metamodel)
+                .query().getRoots());
         while (!froms.isEmpty()) {
             From<?, ?> from = froms.poll();
             Class<?> type = from instanceof Join<?, ?> join ? joinedType(join.getAttribute()) : from.getJavaType();
@@ -1572,13 +1805,9 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
      * closes the order (api/11 §5, R-PAG-01, R-PAG-11).
      */
     private <E2, M> void appendStableOrder(ModelQuery<E2, ?, M> q, BuiltQuery<M> built) {
-        List<? extends SelectField<M, ?>> tieBreakers = q.isGrouped()
-                ? q.groupBy()
-                : q.primaryKey().<List<? extends SelectField<M, ?>>>map(key -> key.columns()).orElse(List.of());
         List<Order> orders = null;
-        for (SelectField<M, ?> column : tieBreakers) {
-            boolean ordered = q.orderBy().stream().map(OrderField::column).anyMatch(column::equals);
-            if (!ordered) {
+        for (SelectField<M, ?> column : tieBreakers(q)) {
+            if (!isOrdered(q, column)) {
                 if (orders == null) {
                     orders = new ArrayList<>(built.query().getOrderList());
                 }
@@ -1588,6 +1817,35 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
         if (orders != null) {
             built.query().orderBy(orders);
         }
+    }
+
+    /** The columns that close a stable order: the primary key, or the group keys of a grouped query (R-PAG-01). */
+    private static <M> List<? extends SelectField<M, ?>> tieBreakers(ModelQuery<?, ?, M> q) {
+        return q.isGrouped()
+                ? q.groupBy()
+                : q.primaryKey().<List<? extends SelectField<M, ?>>>map(key -> key.columns()).orElse(List.of());
+    }
+
+    /**
+     * Whether {@code column} can read NULL: false only for a path to an id, a non-optional or a primitive attribute
+     * that no LEFT join sits above, so the common key orders plainly and an index can satisfy it (R-EXE-12).
+     */
+    static boolean mayBeNull(SelectField<?, ?> column, JoinContext joins) {
+        if (!(column.expression(joins) instanceof Path<?> path)
+                || !(path.getModel() instanceof SingularAttribute<?, ?> attribute)) {
+            return true;
+        }
+        for (Path<?> up = path.getParentPath(); up != null; up = up.getParentPath()) {
+            if (up instanceof Join<?, ?> join && join.getJoinType() != JoinType.INNER) {
+                return true;
+            }
+        }
+        return !(attribute.isId() || !attribute.isOptional() || attribute.getJavaType().isPrimitive());
+    }
+
+    /** Whether {@code q}'s own {@code orderBy} already orders by {@code column}. */
+    private static <M> boolean isOrdered(ModelQuery<?, ?, M> q, SelectField<M, ?> column) {
+        return q.orderBy().stream().map(OrderField::column).anyMatch(column::equals);
     }
 
     // ---- primary-key-first
@@ -1657,6 +1915,9 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
 
     /** A step-2 row, with the statement that read it. */
     private record Found<M>(BuiltQuery<M> built, Tuple tuple) {}
+
+    /** A {@code byKeys} row, decoded, with the statement that read it. */
+    private record ReadRow<M>(BuiltQuery<M> built, Row row) {}
 
     /**
      * The most keys one step-2 statement takes: the configured batch size, if any, within the largest power of two
@@ -1865,28 +2126,38 @@ final class DefaultModelQueryExecutor<E> implements ModelQueryExecutor<E> {
             for (ColumnField<?, ?, ?> column : selectedColumns(field)) {
                 Join<?, ?> join = toManyJoin(column, built.joins());
                 if (join != null) {
-                    Attribute<?, ?> attribute = join.getAttribute();
                     throw new ModelQueryExecutionException(MqCode.MQ2204, q + ": " + operation + " "
                             + (expression ? "reads a column of an expression" : "selects a column")
-                            + " through the to-many join "
-                            + attribute.getDeclaringType().getJavaType().getSimpleName() + "." + attribute.getName()
-                            + ", so one primary key spans several rows; select from the child side, or filter with "
-                            + "Filters.exists(...)");
+                            + " through the to-many join " + joinName(join) + ", so one primary key spans several "
+                            + "rows; select from the child side, or filter with Filters.exists(...)");
                 }
             }
         }
     }
 
+    /** {@code join}'s attribute as a message names it: {@code Owner.attribute}. */
+    private static String joinName(Join<?, ?> join) {
+        Attribute<?, ?> attribute = join.getAttribute();
+        return attribute.getDeclaringType().getJavaType().getSimpleName() + "." + attribute.getName();
+    }
+
     /** Whether {@code built}'s selection reads any column through a to-many join (R-PAG-13). */
     private static boolean readsThroughToMany(BuiltQuery<?> built) {
+        return !selectedToManyJoins(built).isEmpty();
+    }
+
+    /** The to-many joins {@code built}'s selected columns are read through, one per such column (R-PAG-13). */
+    private static List<Join<?, ?>> selectedToManyJoins(BuiltQuery<?> built) {
+        List<Join<?, ?>> joins = new ArrayList<>();
         for (SelectField<?, ?> field : built.selection().fields()) {
             for (ColumnField<?, ?, ?> column : selectedColumns(field)) {
-                if (toManyJoin(column, built.joins()) != null) {
-                    return true;
+                Join<?, ?> join = toManyJoin(column, built.joins());
+                if (join != null) {
+                    joins.add(join);
                 }
             }
         }
-        return false;
+        return joins;
     }
 
     /** The columns a selected field reads: a column itself, an expression's operands, or none for an aggregate. */

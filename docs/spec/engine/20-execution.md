@@ -1,8 +1,9 @@
-# 20 — Execution: list, page, count, stream
+# 20 — Execution: list, page, count, stream, single-row reads
 
 **Covers:** what each executor method does, how counting works for grouped and collection-join queries, limit and page
-validation, and the connection lifetime of a stream.
-**Read when:** changing `list`/`page`/`count`/`stream`, or explaining a wrong total or a leaked connection.
+validation, the connection lifetime of a stream, and the single-row reads `one` and `first`.
+**Read when:** changing `list`/`page`/`count`/`stream`/`one`/`first`, or explaining a wrong total or a leaked
+connection.
 **Owns:** `R-EXE-*`, `AC-EXE-*`. Paging, cursors and export are `engine/21`.
 
 ---
@@ -46,7 +47,9 @@ join, each joined row is a result, so `count` counts rows and agrees with `list`
 (`engine/21` R-PAG-13).
 
 **R-EXE-05** The count query drops `orderBy` and any selection the count does not need, and keeps every predicate and
-join that can change the number of matching rows.
+join that can change the number of matching rows. A direct `count(q)` on a query with an `orderBy` logs one `WARNING`
+per `ModelQuery`, `<Model>: count(query) ignores the query's orderBy`; the count `page` runs for its total logs
+nothing, since `page` uses the order (D-126).
 
 ## 4. Limits and validation
 
@@ -84,7 +87,64 @@ must be positive (`MQ4003`) and applies to every statement the executor runs; un
 statement its timeout cancelled as `QueryTimeoutException` on every supported Hibernate version, translating a
 cancellation (SQLState `57014`) a provider reports as a plain `PersistenceException`.
 
-## 7. Acceptance criteria
+## 7. Single-row reads
+
+**R-EXE-12** `one(q)`, `first(q)` and `one(q, key)` read at most one model and return it as an `Optional`; each is
+abstract and `@Incubating` on `ModelQueryExecutor` (D-123). A default built on `list` would run the fetch plan on the
+extra row, so none is one (`delivery/61` R-REL-07).
+
+- `one(q)` renders the statement `list` would, with a limit of 2. A second row throws `MQ2003`
+  (`OrderView: one(query) found more than one row`) before any row is mapped or the fetch plan runs; the fetch plan
+  then runs once, on the single row left, so an enricher never sees the extra row. `one` counts rows as `list`
+  returns them: `list` does not deduplicate, so a predicate-only to-many join (R-EXE-04, `engine/21` R-PAG-02) can
+  repeat the root row and give `MQ2003`. The message then names the join and points at `Filters.exists`.
+- `first(q)` renders with a limit of 1 and a stable order: `q`'s `orderBy`, then the primary key (or, for a grouped
+  query, its group keys) wherever the `orderBy` does not already cover it. With no `orderBy`, that is the key
+  ascending. An implicit column that can be NULL sorts `nullsLast` explicitly (`api/10` R-COL-12), since vendors place
+  NULL differently (INV-6); a column that cannot (an `@Id`, a non-optional or a primitive attribute, not read through
+  a LEFT join) sorts plain ascending, so an index can satisfy `ORDER BY ... LIMIT 1` where the vendor renders
+  `nullsLast` as a `CASE`. When the selection reads through a to-many join the key spans several rows, so the chosen
+  row is not deterministic, as with offset paging (`engine/21` R-PAG-13 refuses only key-based paging). A query with neither an
+  `orderBy` nor a key throws `MQ2203` (`api/11` R-QRY-03) before any statement; a grouped query's key is its group
+  keys, and one that only aggregates (no `groupBy`) has exactly one row, so it needs neither.
+- `one(q, key)` adds `primary key = key` to `q`'s filter, converting each component as `whereKey` does
+  (`api/14` R-WRT-08), and behaves as `one(q)`. A `q` that already filters on its key is accepted: the filters AND
+  together, and contradictory ones give empty. A `null` key, a `null` component, or a composite key with the wrong
+  number of components throws `IllegalArgumentException`. A query without a primary key throws `MQ2203`, before any
+  statement: a keyless query has `K = Object`, and a grouped query keeps the builder's `K` but drops its key
+  (`api/13` R-AGG-09), so in both any key compiles. A second row is possible only for a `@PrimaryKey` that is not the
+  id (a unique column on a view), and is `MQ2003` there too.
+- `one(q)` and `one(q, key)` read at most one row, so neither renders an `ORDER BY`; each logs one `WARNING` per
+  `ModelQuery` and call when `q` has an `orderBy`, `<Model>: one(query) ignores the query's orderBy` (`one(query,
+  key)` for the keyed one). `first` uses the order and is unchanged (D-126).
+- All three take fetch plans and customizers as `list` does. `primaryKeyFirst(...)` applies only past its offset
+  threshold, so at offset 0 it has no effect. The SQL is `list`'s with a limit (and, for `first`, the order above),
+  so `one` and `first` add no vendor surface.
+
+**R-EXE-13** `byKeys(q, keys)` reads the models of many keys into an unmodifiable `Map<K, M>`; it is abstract and
+`@Incubating` on `ModelQueryExecutor` (D-126, `delivery/61` R-REL-07).
+
+- Each key is converted as `whereKey` converts it (`api/14` R-WRT-08) and ANDed with `q`'s filter, as `one(q, key)`
+  does; a filter that excludes a key's row leaves that key out. The map iterates in the order of the keys' first
+  occurrence, and a key with no row is absent.
+- Checks run in this order, all before the empty-keys shortcut: `q` and `keys` non-null (`NullPointerException`);
+  `MQ2203` for a query without a primary key, a grouped one included; then every key converted
+  (`IllegalArgumentException` for a `null` key or component, a converter returning `null`, or a composite key with the
+  wrong number of components). No keys gives an empty map and runs no SQL.
+- The converted keys are spread over statements as `engine/21` R-PAG-07 step 2 spreads its keys (each chunk at most
+  the largest power of two within `maxInListSize()` and `maxBindParameters()` less the statement's own binds, one
+  bind per key component), without `primaryKeyFirstBatchSize`. Every statement is built in `Phase.MODEL` and renders no
+  `ORDER BY`; `q`'s `orderBy` is ignored, with one `WARNING` per `ModelQuery`, `<Model>: byKeys(query, keys) ignores
+  the query's orderBy; the map is in key order`.
+- Every chunk is read, then checked, then mapped. A key matching two rows is `MQ2003` (`<Model>: byKeys(query, keys)
+  found more than one row for key <k>`, naming the filter-only to-many join and `Filters.exists` as `one` does). A row
+  whose key equals none of the requested values (a case-insensitive or padding collation, a `BigDecimal` scale) is
+  `MQ2005`, naming the value. Neither lets `afterMap` or the fetch plan see a row.
+- Rows are matched to keys by the converted attribute value (`api/10` R-COL-11). Every caller key whose value matched
+  gets an entry, so keys converting to one value share one model; `afterMap` runs once per row (`api/11` R-QRY-05).
+  The fetch plan runs once over every row, in key order (`api/15` R-FCH-05). Memory is the whole result.
+
+## 8. Acceptance criteria
 
 | ID | Criterion |
 |---|---|
@@ -98,3 +158,8 @@ cancellation (SQLState `57014`) a provider reports as a plain `PersistenceExcept
 | AC-EXE-07 | An early exit from `body` releases the connection, checked against the pool's active count (R-EXE-09). |
 | AC-EXE-08 | PostgreSQL streaming without a transaction throws `MQ2101` before executing (R-EXE-08). |
 | AC-EXE-09 | A slow query is cancelled by the configured timeout on every Tier-1 vendor (R-EXE-11). |
+| AC-EXE-11 | `one` reads at a limit of 2 and returns the single row or empty; a second row throws `MQ2003` before an enricher or `afterMap` sees it, and through a predicate-only to-many join the message names the join and `Filters.exists` (R-EXE-12). |
+| AC-EXE-12 | `first` orders by `orderBy`, then the key with explicit `nullsLast`: on a nullable non-id `@PrimaryKey` it returns the same row on every Tier-1 vendor; a grouped `first` orders by its group keys; a query with neither an `orderBy` nor a key throws `MQ2203`, an aggregate-only query excepted (R-EXE-12). |
+| AC-EXE-13 | `one(q, key)` ANDs the converted key with `q`'s filter, and contradictory filters give empty; a `null` key or component, or a wrong component count, throws `IllegalArgumentException`; a keyless or grouped query throws `MQ2203` (R-EXE-12). |
+| AC-EXE-14 | `byKeys` returns the map in first-occurrence key order with missing keys absent and duplicates read once, for single and composite keys; more keys than the vendor's limits give several statements and one fetch-plan run, and a configured `primaryKeyFirstBatchSize` does not change the chunks; no keys run no SQL; the `orderBy` is ignored with one `WARNING` and no `ORDER BY`; a key matching two rows is `MQ2003`; a keyless query is `MQ2203`, with empty keys too; two keys converting to one value are both present with `afterMap` run once; a `MODEL`-phase customizer applies; a case-insensitive string key on MySQL and SQL Server whose row matches no requested value is `MQ2005` (R-EXE-13). |
+| AC-EXE-15 | `count(q)`, `one(q)` and `one(q, key)` on an ordered query each log one `WARNING` per `ModelQuery`; the `one` statements render no `ORDER BY`; `page`'s count and `first` log nothing (R-EXE-05, R-EXE-12). |

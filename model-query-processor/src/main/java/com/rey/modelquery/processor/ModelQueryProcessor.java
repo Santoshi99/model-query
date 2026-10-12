@@ -42,13 +42,13 @@ public final class ModelQueryProcessor extends AbstractProcessor {
         var types = processingEnv.getTypeUtils();
         var reader = new QueryModelReader(processingEnv.getOptions());
         var nestedModels = new NestedModels(reader);
-        var metamodel = new EntityMetamodel(types);
+        var metamodel = new EntityMetamodel(types, processingEnv.getElementUtils());
         var elements = processingEnv.getElementUtils();
         var builtIns = new BuiltInConverters(elements);
         var round = new Round(reader, nestedModels, new ModelValidator(types, metamodel, nestedModels, builtIns),
                 new QModelWriter(types, metamodel, nestedModels, builtIns),
                 // A model module without Bean Validation, or without model-query-jpa, compiles and references neither.
-                new ChangesWriter(types, elements.getTypeElement(ChangesWriter.VALID_CHANGES) != null
+                new ChangesWriter(types, metamodel, elements.getTypeElement(ChangesWriter.VALID_CHANGES) != null
                         && elements.getTypeElement(ChangesWriter.CONSTRAINT) != null),
                 roundEnv.processingOver());
         // An element is only valid in the round that produced it, so a deferred model is looked up again by name.
